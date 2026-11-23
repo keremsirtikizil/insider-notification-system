@@ -1,0 +1,118 @@
+# One-command setup:  docker compose up --build
+#
+#   API + Swagger UI   http://localhost:8080/docs
+#   Jaeger (traces)    http://localhost:16686
+#   Prometheus         http://localhost:9090
+#   Mock provider      http://localhost:8090/stats
+#
+# To deliver through webhook.site instead of the bundled mock provider, put
+# PROVIDER_URL=https://webhook.site/<your-uuid> in a .env file (see .env.example).
+
+name: notification-system
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://notifier:notifier@postgres:5432/notifier?sslmode=disable
+  REDIS_URL: redis://redis:6379/0
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+x-app: &app
+  build: .
+  image: notification-system:latest
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: notifier
+      POSTGRES_PASSWORD: notifier
+      POSTGRES_DB: notifier
+    # Not published to the host (avoids clashing with a local PostgreSQL);
+    # use `docker compose exec postgres psql -U notifier` to inspect.
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifier -d notifier"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *app
+    command: ["migrate", "up"]
+    restart: "no"
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *app
+    command: ["api"]
+    environment: *app-env
+    ports: ["8080:8080"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/notifier", "healthcheck", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Scale out with `docker compose up --scale worker=3`: the PostgreSQL queue
+  # (SKIP LOCKED) and the Redis rate limiter are shared by every replica.
+  worker:
+    <<: *app
+    command: ["worker"]
+    stop_grace_period: 30s # let in-flight provider calls finish and be recorded
+    environment:
+      <<: *app-env
+      PROVIDER_URL: ${PROVIDER_URL:-http://mock-provider:8090/send}
+      RATE_LIMIT_PER_SECOND: ${RATE_LIMIT_PER_SECOND:-100}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      mock-provider: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/notifier", "healthcheck", "http://127.0.0.1:9091/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mock-provider:
+    <<: *app
+    entrypoint: ["/usr/local/bin/mockprovider"]
+    command: []
+    environment:
+      ADDR: ":8090"
+      FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.1}
+      THROTTLE_RATE: ${MOCK_THROTTLE_RATE:-0.0}
+      LATENCY_MIN: 20ms
+      LATENCY_MAX: 150ms
+    ports: ["8090:8090"]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP/HTTP
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    depends_on: [api, worker]
+
+volumes:
+  pgdata:
