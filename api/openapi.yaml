@@ -1,0 +1,722 @@
+openapi: 3.0.3
+info:
+  title: Event-Driven Notification Service
+  version: 1.0.0
+  description: |
+    Accepts notification requests (SMS, email, push), queues them durably in
+    PostgreSQL and delivers them asynchronously through an external provider with
+    per-channel rate limiting (100 msg/s per channel by default), priorities,
+    retries with exponential backoff, a circuit breaker, scheduling and templates.
+
+    **Correlation IDs** — send `X-Correlation-ID` (or `X-Request-ID`) to trace a request
+    across the API, the worker logs and the provider call; one is generated otherwise
+    and returned in the response header.
+
+    **Real-time updates** — `GET /v1/ws` upgrades to a WebSocket that streams
+    `StatusEvent` messages (see the schema), optionally filtered by
+    `notification_id`, `batch_id` and/or `channel`.
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: Notifications
+  - name: Batches
+  - name: Templates
+  - name: Observability
+
+paths:
+  /v1/notifications:
+    post:
+      tags: [Notifications]
+      summary: Create a notification
+      description: |
+        Validates and enqueues one notification. Delivery is asynchronous: the
+        response is `202 Accepted` with status `pending` (or `scheduled`).
+        Repeating a request with the same idempotency key returns the original
+        notification with `200 OK` and `Idempotent-Replayed: true`; reusing the
+        key with a different payload returns `409`.
+      operationId: createNotification
+      parameters:
+        - $ref: '#/components/parameters/CorrelationID'
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Alternative to the `idempotency_key` body field.
+          schema: { type: string, maxLength: 255 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationRequest' }
+            examples:
+              sms:
+                summary: Plain SMS
+                value: { recipient: "+905551234567", channel: sms, content: "Your code is 4821", priority: high }
+              templated:
+                summary: Email from a template
+                value:
+                  recipient: jane@example.com
+                  channel: email
+                  template_id: 6f1d1f0c-3a5e-4a59-9b8e-2f0a0b0c0d0e
+                  variables: { name: Jane, discount: "20" }
+              scheduled:
+                summary: Scheduled push with idempotency key
+                value:
+                  recipient: "fcm:APA91bHun4MxP5egoKMwt2KZFBaFUH"
+                  channel: push
+                  content: "Breaking news!"
+                  scheduled_at: "2026-12-01T09:00:00Z"
+                  idempotency_key: "news-2026-12-01-push-42"
+      responses:
+        '202':
+          description: Accepted for delivery.
+          headers:
+            Location: { schema: { type: string } }
+            X-Correlation-ID: { $ref: '#/components/headers/CorrelationID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Notification' }
+        '200':
+          description: Idempotent replay; the existing notification is returned.
+          headers:
+            Idempotent-Replayed: { schema: { type: string, enum: ["true"] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Notification' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    get:
+      tags: [Notifications]
+      summary: List notifications
+      description: Newest first, keyset (cursor) pagination.
+      operationId: listNotifications
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/Status' } }
+        - { name: channel, in: query, schema: { $ref: '#/components/schemas/Channel' } }
+        - { name: priority, in: query, schema: { $ref: '#/components/schemas/Priority' } }
+        - { name: batch_id, in: query, schema: { type: string, format: uuid } }
+        - name: created_from
+          in: query
+          description: Inclusive lower bound (RFC 3339).
+          schema: { type: string, format: date-time }
+        - name: created_to
+          in: query
+          description: Exclusive upper bound (RFC 3339).
+          schema: { type: string, format: date-time }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - name: cursor
+          in: query
+          description: Opaque `next_cursor` from the previous page.
+          schema: { type: string }
+      responses:
+        '200':
+          description: One page of notifications.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/notifications/batch:
+    post:
+      tags: [Notifications]
+      summary: Create up to 1000 notifications at once
+      description: |
+        All-or-nothing: if any item is invalid the whole batch is rejected with
+        `422` and per-item error paths such as `notifications[3].recipient`.
+        Items whose idempotency key already exists are returned with
+        `duplicate: true` and are not counted in the batch.
+      operationId: createBatch
+      parameters:
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchRequest' }
+      responses:
+        '202':
+          description: Batch accepted.
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BatchCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/notifications/{id}:
+    get:
+      tags: [Notifications]
+      summary: Get a notification and its delivery status
+      operationId: getNotification
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: The notification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Notification' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/notifications/{id}/attempts:
+    get:
+      tags: [Notifications]
+      summary: Delivery attempt history
+      operationId: listAttempts
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: Attempts, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryAttempt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/notifications/{id}/cancel:
+    post:
+      tags: [Notifications]
+      summary: Cancel a notification that has not been picked up yet
+      description: Allowed while `pending`, `scheduled` or `retrying`; otherwise `409`.
+      operationId: cancelNotification
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Notification' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/notifications/{id}/retry:
+    post:
+      tags: [Notifications]
+      summary: Re-queue a failed notification (dead-letter replay)
+      description: Resets the attempt budget. Only allowed for `failed` notifications.
+      operationId: retryNotification
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: Re-queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Notification' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/batches/{id}:
+    get:
+      tags: [Batches]
+      summary: Batch progress
+      description: Use `GET /v1/notifications?batch_id=` for the individual items.
+      operationId: getBatch
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: Status counts of the batch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Batch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/batches/{id}/cancel:
+    post:
+      tags: [Batches]
+      summary: Cancel every still-queued notification of a batch
+      operationId: cancelBatch
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: Number of cancelled notifications.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [batch_id, cancelled]
+                properties:
+                  batch_id: { type: string, format: uuid }
+                  cancelled: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/templates:
+    post:
+      tags: [Templates]
+      summary: Create a message template
+      description: Placeholders use `{{name}}` syntax; values are substituted literally.
+      operationId: createTemplate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TemplateRequest' }
+            example: { name: order.shipped, channel: sms, content: "Hi {{name}}, order {{order_id}} is on its way." }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    get:
+      tags: [Templates]
+      summary: List templates
+      operationId: listTemplates
+      responses:
+        '200':
+          description: All templates ordered by name.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Template' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/templates/{id}:
+    get:
+      tags: [Templates]
+      summary: Get a template
+      operationId: getTemplate
+      parameters: [ { $ref: '#/components/parameters/ID' } ]
+      responses:
+        '200':
+          description: The template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/metrics:
+    get:
+      tags: [Observability]
+      summary: Real-time delivery metrics (all instances)
+      description: |
+        Queue depth, success / failure rates, throughput and latency percentiles,
+        computed from the database so the numbers cover every API and worker
+        instance. Per-process Prometheus metrics are on `/metrics`.
+      operationId: metricsSummary
+      parameters:
+        - name: window
+          in: query
+          description: Look-back window as a Go duration (10s–24h).
+          schema: { type: string, default: 5m, example: 15m }
+      responses:
+        '200':
+          description: Metrics snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricsSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/ws:
+    get:
+      tags: [Observability]
+      summary: WebSocket stream of status changes
+      description: |
+        Upgrade to a WebSocket. The server first sends
+        `{"type":"subscribed","filters":{...}}`, then one `StatusEvent` JSON message
+        per status change that matches the filters.
+      operationId: subscribe
+      parameters:
+        - { name: notification_id, in: query, schema: { type: string, format: uuid } }
+        - { name: batch_id, in: query, schema: { type: string, format: uuid } }
+        - { name: channel, in: query, schema: { $ref: '#/components/schemas/Channel' } }
+      responses:
+        '101':
+          description: Switching protocols; messages follow the StatusEvent schema.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusEvent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /metrics:
+    get:
+      tags: [Observability]
+      summary: Prometheus metrics of this process
+      operationId: prometheus
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /healthz:
+    get:
+      tags: [Observability]
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        '200':
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [Observability]
+      summary: Readiness probe (PostgreSQL and Redis reachable)
+      operationId: readyz
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: A dependency is unavailable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+components:
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    CorrelationID:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Propagated to logs, stored notifications and the provider call.
+      schema: { type: string, maxLength: 128, pattern: '^[A-Za-z0-9._:\-]+$' }
+
+  headers:
+    CorrelationID:
+      description: The correlation ID of this request.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed JSON, unknown field, invalid ID or query parameter.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: State conflict (e.g. cancelling a sent notification) or idempotency key reused with a different payload.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooLarge:
+      description: Request body too large (1 MiB single, 16 MiB batch).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnsupportedMediaType:
+      description: Content-Type is not application/json.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationFailed:
+      description: One or more fields break the validation rules.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: validation_failed
+              message: the request contains invalid fields
+              details:
+                - { field: "notifications[3].recipient", message: "must be an E.164 phone number such as +905551234567" }
+            correlation_id: 3f6c2b1e-9f7a-4d8e-8c55-0b2f1d3e4a5b
+    InternalError:
+      description: Unexpected server error (details are only logged).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Channel:
+      type: string
+      enum: [sms, email, push]
+    Priority:
+      type: string
+      enum: [high, normal, low]
+    Status:
+      type: string
+      enum: [pending, scheduled, processing, retrying, sent, failed, cancelled]
+      description: |
+        pending → processing → sent | retrying → … | failed.
+        scheduled becomes due at `scheduled_at`. cancelled is set by the API.
+
+    NotificationRequest:
+      type: object
+      additionalProperties: false
+      required: [recipient, channel]
+      description: Either `content` or `template_id` (+ `variables`) must be given.
+      properties:
+        recipient:
+          type: string
+          description: |
+            sms: E.164 phone number (`+905551234567`) · email: plain address ·
+            push: device token, 16–512 chars `[A-Za-z0-9_-:.]`
+        channel: { $ref: '#/components/schemas/Channel' }
+        content:
+          type: string
+          description: Max characters — sms 1600, email 20000, push 1000.
+        priority:
+          allOf: [ { $ref: '#/components/schemas/Priority' } ]
+          default: normal
+        template_id: { type: string, format: uuid }
+        variables:
+          type: object
+          additionalProperties: { type: string }
+        scheduled_at:
+          type: string
+          format: date-time
+          description: Future delivery time (at most 30 days ahead).
+        idempotency_key: { type: string, maxLength: 255 }
+
+    BatchRequest:
+      type: object
+      additionalProperties: false
+      required: [notifications]
+      properties:
+        notifications:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items: { $ref: '#/components/schemas/NotificationRequest' }
+
+    Notification:
+      type: object
+      required: [id, channel, recipient, content, priority, status, attempts, correlation_id, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        batch_id: { type: string, format: uuid, nullable: true }
+        idempotency_key: { type: string, nullable: true }
+        correlation_id: { type: string }
+        channel: { $ref: '#/components/schemas/Channel' }
+        recipient: { type: string }
+        content: { type: string }
+        priority: { $ref: '#/components/schemas/Priority' }
+        status: { $ref: '#/components/schemas/Status' }
+        attempts: { type: integer, description: Provider calls made so far. }
+        template_id: { type: string, format: uuid, nullable: true }
+        scheduled_at: { type: string, format: date-time, nullable: true }
+        next_attempt_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the notification becomes due (only while queued).
+        provider_message_id: { type: string, nullable: true }
+        last_error: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        sent_at: { type: string, format: date-time, nullable: true }
+        failed_at: { type: string, format: date-time, nullable: true }
+        cancelled_at: { type: string, format: date-time, nullable: true }
+
+    NotificationList:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Notification' }
+        pagination:
+          type: object
+          required: [limit]
+          properties:
+            limit: { type: integer }
+            next_cursor: { type: string, nullable: true }
+
+    BatchCreated:
+      type: object
+      required: [batch_id, accepted, duplicates, notifications]
+      properties:
+        batch_id: { type: string, format: uuid }
+        accepted: { type: integer, description: Newly created notifications. }
+        duplicates: { type: integer, description: Items answered from an existing idempotency key. }
+        notifications:
+          type: array
+          items:
+            type: object
+            required: [index, id, status, duplicate]
+            properties:
+              index: { type: integer }
+              id: { type: string, format: uuid }
+              status: { $ref: '#/components/schemas/Status' }
+              idempotency_key: { type: string, nullable: true }
+              batch_id: { type: string, format: uuid, nullable: true }
+              duplicate: { type: boolean }
+
+    Batch:
+      type: object
+      required: [id, total, status_counts, completed, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        total: { type: integer }
+        status_counts:
+          type: object
+          additionalProperties: { type: integer }
+          example: { pending: 10, scheduled: 0, processing: 2, retrying: 1, sent: 980, failed: 7, cancelled: 0 }
+        completed: { type: boolean, description: No notification of the batch is waiting or in flight. }
+        created_at: { type: string, format: date-time }
+
+    DeliveryAttempt:
+      type: object
+      required: [attempt, outcome, duration_ms, created_at]
+      properties:
+        attempt: { type: integer }
+        outcome: { type: string, enum: [success, retryable_error, permanent_error] }
+        status_code: { type: integer, nullable: true }
+        error: { type: string, nullable: true }
+        duration_ms: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    TemplateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, channel, content]
+      properties:
+        name: { type: string, pattern: '^[a-z0-9][a-z0-9_.-]*$', maxLength: 100 }
+        channel: { $ref: '#/components/schemas/Channel' }
+        content: { type: string }
+
+    Template:
+      type: object
+      required: [id, name, channel, content, variables, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        channel: { $ref: '#/components/schemas/Channel' }
+        content: { type: string }
+        variables: { type: array, items: { type: string } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    StatusEvent:
+      type: object
+      required: [type, notification_id, channel, status, attempts, occurred_at]
+      properties:
+        type: { type: string, enum: [notification.status_changed] }
+        notification_id: { type: string, format: uuid }
+        batch_id: { type: string, format: uuid }
+        channel: { $ref: '#/components/schemas/Channel' }
+        status: { $ref: '#/components/schemas/Status' }
+        attempts: { type: integer }
+        provider_message_id: { type: string }
+        error: { type: string }
+        correlation_id: { type: string }
+        occurred_at: { type: string, format: date-time }
+
+    MetricsSummary:
+      type: object
+      required: [generated_at, window_seconds, queue_depth, channels]
+      properties:
+        generated_at: { type: string, format: date-time }
+        window_seconds: { type: integer }
+        queue_depth: { type: integer, description: Unfinished notifications across all channels. }
+        channels:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/ChannelMetrics' }
+
+    ChannelMetrics:
+      type: object
+      properties:
+        queue:
+          type: object
+          description: Count per unfinished status.
+          additionalProperties: { type: integer }
+        queued_by_priority:
+          type: object
+          additionalProperties: { type: integer }
+        sent: { type: integer }
+        failed: { type: integer }
+        success_rate: { type: number }
+        failure_rate: { type: number }
+        throughput_per_second: { type: number }
+        latency_ms:
+          type: object
+          description: End-to-end latency (created or scheduled time → provider accepted).
+          properties:
+            avg: { type: number }
+            p50: { type: number }
+            p95: { type: number }
+            p99: { type: number }
+        provider:
+          type: object
+          properties:
+            attempts: { type: integer }
+            errors: { type: integer }
+            error_rate: { type: number }
+            latency_avg_ms: { type: number }
+            latency_p95_ms: { type: number }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_json, invalid_id, invalid_query, validation_failed, not_found, invalid_state,
+                     duplicate, idempotency_conflict, body_too_large, unsupported_media_type, internal_error]
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, message]
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+        correlation_id: { type: string }
